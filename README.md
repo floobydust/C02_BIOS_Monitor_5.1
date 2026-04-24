@@ -11,7 +11,7 @@ Some changes/fixes have been made to the Disk BIOS support:
 The Partition Block code is unchanged, but does work with this BIOS version.
  - BIOS will load and verify the partition block when booting up, provided a Disk is found.
  - user timeout will be shown is the partition block is valid, else the Monitor is invoked.
- - the Boot Block code still needs work and will also require an update MD_Utility for Disk setup.
+ - the Boot Block code still needs work and will also require an updated MD_Utility for Disk setup.
 
 Also provided is an updated MD_Utiliity v0.91
  - handles errors in block calculations if out of range.
