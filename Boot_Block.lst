@@ -1,0 +1,448 @@
+  Fri Apr 11 2025  7:14                                                                                                    Page 1
+
+
+                                               ***************************************
+                                               **      WDC 65C02 Macro Assembler    **
+                                               **                                   **
+                                               **     Version 3.49.1- Feb  6 2006    **
+                                               ***************************************
+
+     1                        ;**************************************************************************************************
+     2                        ;*                                                                                                *
+     3                        ;*                            Microdrive Boot Block for Booting an OS                             *
+     4                        ;*                                                                                                *
+     5                        ;*                                                                                                *
+     6                        ;*                                  11/14/2025 (Day/Month/Year)                                   *
+     7                        ;*                                                                                                *
+     8                        ;*                                    Copyright Kevin Maier                                       *
+     9                        ;*                                                                                                *
+    10                        ;*                                     GNU GPL V3 License                                         *
+    11                        ;*                                                                                                *
+    12                        ;**************************************************************************************************
+    13                        ; Boot Block 1.00                                                                                 *
+    14                        ; - Boot Block format for enabling a boot from the Microdrive.                                    *
+    15                        ; - As this is based on 65C02 code to boot an OS from a marked active partition, we don't         *
+    16                        ;       really need to try and be as compatible to a typical Boot Record structure.               *
+    17                        ;                                                                                                 *
+    18                        ; - Once this Boot Block is loaded by the Partition Block loader, control is turned over here.    *
+    19                        ;                                                                                                 *
+    20                        ; - The Partition Loader is coded to load into the C02 Pocket TEA address of $0800 and will       *
+    21                        ;       do a JMP to $0800 when successfully loaded from the Microdrive.                           *
+    22                        ;                                                                                                 *
+    23                        ;**************************************************************************************************
+    24                                PL      66      ;Page Length
+    25                                PW      132     ;Page Width (# of char/line)
+    26                                CHIP    W65C02S ;Enable WDC 65C02 instructions
+    27                                PASS1   OFF     ;Set ON for debugging
+    28                                INCLIST ON      ;Set ON for listing Include files
+    29                        ;**************************************************************************************************
+    30                         ;Include required constants/equates for Boot Block to assemble
+    31                        ;
+    35                                LIST
+    36                        ;
+    37                        ;**************************************************************************************************
+    38                        ;
+    39                        ; Note that the ORG statement below is hard-coded for specific use with the C02 Pocket SBC!
+    40                        ; - Once this Boot Block is loaded, the following actions are taken:
+    41                        ;       - The block is tested for the signature at the end ($55AA)
+    42                        ;       - If invalid, an error is shown and jumps to the Monitor Warm vector
+    43                        ;       - If valid, boot code loading from the Boot Parameter Block (BPB) data.
+    44                        ;       - Note that the BPB is at the end of Boot Block and is similar to that of the
+    45                        ;               Partition Record. It contains extra information to complete the Boot Process.
+    46                        ;
+    47                        ; The Block data is part of the Boot loader code, i.e., it knows how many blocks to load
+    48                        ; from the drive into memory and the memory address to load to. It also has a pointer to
+    49                        ; the start of executable code, which completes the basic Boot process.
+    50                        ; - Control is now turned over to the executable code that boots the OS.
+    51                        ;
+    52                                .ORG    $0800           ;Boot block load address (from Partition block)
+    53                        ;
+    54 00:0800: A9 2A                LDA     #'*'            ;Get an asterisk
+    55 00:0802: 20 21 FF             JSR     B_CHROUT        ;Send to the console
+    56                        ;
+    57                        ; We send an asterisk to the console first to show the Boot Block has been loaded and executed.
+    58                        ;
+    59                        ; Now that the Boot Block has been loaded and executed, we check for the correct signature first.
+    60                        ; - The signature is the standard $AA55, which is at the end of the Boot Block.
+  Fri Apr 11 2025  7:14                                                                                                    Page 2
+
+
+    61                        ; Note that the Boot Block has been loaded to a hard-coded location of $0800, so the signature
+    62                        ;   is located at $09FE - $09FF.
+    63                        ;
+    64 00:0805: 20 98 08             JSR     BOOT_CHKSIG     ;Call Boot Block Check Signature routine
+    65                        ;
+    66                        ; Boot Record has the correct signature, yay!
+    67                        ; - Next, validate the Boot Parameter Block Checksum.
+    68                        ; - If this bad, we show an error message and jump to the Monitor warm vector
+    69                        ;
+    70                        ; Calculate checksum for Boot Parameter Block
+    71                        ;
+    72 00:0808: 20 A7 08             JSR     BPB_CHKSUM      ;Call BPB Checksum routine
+    73                        ;
+    74                        ; BPB checksum is good. We should have a correct Boot Block loaded now.
+    75                        ; - The BPB contains details about the Boot Image that will need to be
+    76                        ; - loaded and executed. However, we first need to load the first Block
+    77                        ; - of the Boot Image and examine the Load Header to ensure that its the
+    78                        ; - correct Boot Image. It will be loaded to a hard-coded address that is
+    79                        ; - above the the Boot Block (so we don't overwrite it). 
+    80                        ;
+    81                        ; Load the first Block from the Boot Image
+    82                        ;
+    83 00:080B: A2 01                LDX     #$01            ;Set Block count to one
+    84 00:080D: A9 00                LDA     #$00            ;Get address for DMA
+    85 00:080F: A0 0A                LDY     #$0A            ; to transfer to
+    86 00:0811: 20 CD 08             JSR     LOAD_BLOCK      ;Call Block load routine
+    87                        ;
+    88                        ; The first Block of the Boot Image has been loaded. This contains the Load Header
+    89                        ;
+    90                        ; The Load Header is the first 16 bytes of the first Block of the Boot Image
+    91                        ; - file. It contains information required to validate it, load it and
+    92                        ; - execute it from Boot Block. The Structure is as follows:
+    93                        ;
+    94                        ; - The 16-bit address to start loading the Boot Image to.
+    95                        ; - The 16-bit address to start the Boot Image (BOOT code jumps to this).
+    96                        ; - The 16-bit address for loading the offset to the start of disk data.
+    97                        ; - A long word for the size of the required disk data (for assigned drives).
+    98                        ; - A 5 character string ID to validate the Boot image.
+    99                        ; - A 1 byte checksum to verify the header itself.
+   100                        ; - Next do a checksum on the Load Header, which is the first sixteen
+   101                        ; - bytes of the Boot Image. The last byte is the checksum:
+   102                        ;
+   103 00:0814: 20 BB 08             JSR     HEADER_CHKSUM   ;Call Load Header Checksum routine
+   104                        ;
+   105                        ; Load Header appears good.
+   106                        ; - Now match the Boot Image Signature information against the BPB
+   107                        ; - to ensure we have the correct and matching Boot Image on the disk.
+   108                        ;
+   109 00:0817: A2 05                LDX     #5              ;Set index for String ID length
+   110                        LH_STRING_LP
+   111 00:0819: BD 0A 0A             LDA     $0A00+10,x      ;Get Load Header string
+   112 00:081C: DD F6 09             CMP     BPB_STRING,X    ;Compare against BPB String ID
+   113 00:081F: D0 5A                BNE     BAD_HEADER      ;Branch if bad compare
+   114 00:0821: CA                   DEX                     ;Decrement index
+   115 00:0822: 10 F5                BPL     LH_STRING_LP    ;Loop back until Done
+   116                        ;
+   117                        ; String ID matches, so now we need to boot the full image to the
+   118                        ; correct memory address.
+   119                        ;
+   120 00:0824: AE DF 09             LDX     DISK_BPB+1      ;Get Block count to load
+   121 00:0827: AD E0 09             LDA     DISK_BPB+2      ;Get address for DMA
+   122 00:082A: AC E1 09             LDY     DISK_BPB+3      ; to transfer to
+   123 00:082D: 20 CD 08             JSR     LOAD_BLOCK      ;Call Load routine
+  Fri Apr 11 2025  7:14                                                                                                    Page 3
+
+
+   124                        ;
+   125                        
+   126                        
+   127                        ; - Now we need to get the working details on how to boot the OS:
+   128                        ;       Get the starting LBA from the Boot Parameter Block
+   129                        ;       Get the first LBA to load the boot image from
+   130                        ;       Get the block count of how many blocks to load into memory
+   131                        ;       Get the memory location that the boot image will be loaded to
+   132                        ;       Get the Block offset that is applied to the Boot image for it's drive space
+   133                        ;
+   134                        ; BPB passes the checksum test.
+   135                        ; - Now load the first block of the Boot Image into memory location $0A00
+   136                        ; The Load Header is the first 16 bytes of the first Block of the Boot Image
+   137                        ; - file. It contains information required to validate it, load it and
+   138                        ; - execute it from Boot Block. The Structure is as follows:
+   139                        ;
+   140                        ; - The 16-bit address to start loading the Boot Image to.
+   141                        ; - The 16-bit address to start the Boot Image (BOOT code jumps to this).
+   142                        ; - The 16-bit address for loading the offset to the start of disk data.
+   143                        ; - A long word for the size of the required disk data (for assigned drives).
+   144                        ; - A 5 character string ID to validate the Boot image.
+   145                        ; - A 1 byte checksum to verify the header itself.
+   146                        ; 
+   147                                
+   148                        ; BPB looks good... now try and load the full Boot Image from the disk
+   149                        ;
+   150 00:0830: AE DF 09             LDX     DISK_BPB+1      ;Get Block count to load
+   151 00:0833: AD E0 09             LDA     DISK_BPB+2      ;Get address for DMA
+   152 00:0836: AC E1 09             LDY     DISK_BPB+3      ; to transfer to
+   153 00:0839: 20 CD 08             JSR     LOAD_BLOCK      ;Call Load routine
+   154                        ;
+   155                        
+   156                        ;
+   157                        ; Boot image loaded successfully, now do some checks to ensure it's valid
+   158                        ;
+   159 00:083C: AD FB 09             LDA     DISK_BPB+29     ;Get Address offset into Boot image
+   160 00:083F: AC FC 09             LDY     DISK_BPB+30     ;Low and High byte
+   161 00:0842: 85 00                STA     $00             ;Make a Page Zero pointer
+   162 00:0844: 84 01                STY     $01             ;to access
+   163                        ;
+   164 00:0846: A0 05                LDY     #$05            ;Set count for String ID
+   165                        STRING_CHK
+   166 00:0848: B9 F6 09             LDA     DISK_BPB+24,Y   ;Get String ID from BPB
+   167 00:084B: D1 00                CMP     ($00),Y         ;Compare to Boot image location
+   168 00:084D: D0 32                BNE     NO_OS_FOUND     ;Bad String ID, No OS found
+   169 00:084F: 88                   DEY                     ;Decrement index
+   170 00:0850: 10 F6                BPL     STRING_CHK      ;Loop back until done
+   171                        ;
+   172                        ; String ID Validates Boot Image as valid
+   173                        ; - Now we need to transfer the LBA Offset into the Boot Image for partition data
+   174                        ;
+   175 00:0852: AD EC 09             LDA     DISK_BPB+14     ;Get Address offset into Boot image
+   176 00:0855: AC ED 09             LDY     DISK_BPB+15     ;Low and High byte
+   177 00:0858: 85 00                STA     $00             ;Make a Page Zero pointer
+   178 00:085A: 84 01                STY     $01             ;to access
+   179                        ;
+   180 00:085C: A0 05                LDY     #$05            ;Set count for 4 bytes
+   181                        LBA_OFF_LP
+   182 00:085E: B9 EE 09             LDA     DISK_BPB+16,Y   ;Get LBA Offset
+   183 00:0861: 91 00                STA     ($00),Y         ;Store to Boot Image Disk offsett
+   184 00:0863: 88                   DEY                     ;Decrement index
+   185 00:0864: 10 F8                BPL     LBA_OFF_LP      ;Loop back until done
+   186                        ;
+  Fri Apr 11 2025  7:14                                                                                                    Page 4
+
+
+   187                        ; LBA Data block offset transferred to Boot Image
+   188                        ; - we should now have a valid OS loaded and ready to jump to, fingers crossed!
+   189 00:0866: 6C E2 09             JMP     (DISK_BPB+4)    ;Jump to Boot image and hope it works!
+   190                        ;
+   191                        ;**************************************************************************************************
+   192                        ;
+   193                        BAD_BOOT_BLK
+   194                        ;        PLA                     ;Clear return address from stack
+   195                        ;        PLA                     ;
+   196 00:0869: A9 E5                LDA     #<BAD_BLOCK     ;Get low byte offset
+   197 00:086B: A0 08                LDY     #>BAD_BLOCK     ;Get low byte offset
+   198 00:086D: 80 16                BRA     MSG_FINISH      ;Finish message send/exit
+   199                        ;
+   200                        BAD_BOOT_CHK
+   201 00:086F: A9 03                LDA     #<BAD_CHKSUM    ;Get low byte offset
+   202 00:0871: A0 09                LDY     #>BAD_CHKSUM    ;Get low byte offset
+   203 00:0873: 80 10                BRA     MSG_FINISH      ;Finish message send/exit
+   204                        ;
+   205                        BAD_BOOT_REC
+   206                        ;        PLA                     ;Clear return address from stack
+   207                        ;        PLA                     ;
+   208 00:0875: A9 20                LDA     #<BAD_BOOT_MSG  ;Get low byte offset
+   209 00:0877: A0 09                LDY     #>BAD_BOOT_MSG  ;Get low byte offset
+   210 00:0879: 80 0A                BRA     MSG_FINISH      ;Finish message send/exit
+   211                        ;
+   212                        BAD_HEADER
+   213                        ;        PLA                     ;Clear return address from stack
+   214                        ;        PLA                     ;
+   215 00:087B: A9 33                LDA     #<BAD_HDR_MSG   ;Get low byte offset
+   216 00:087D: A0 09                LDY     #>BAD_HDR_MSG   ;Get low byte offset
+   217 00:087F: 80 04                BRA     MSG_FINISH      ;Finish message send/exit
+   218                        ;
+   219                        NO_OS_FOUND
+   220 00:0881: A9 55                LDA     #<NO_OS         ;Get low byte offset
+   221 00:0883: A0 09                LDY     #>NO_OS         ;Get low byte offset
+   222                        ;
+   223                        ;MSG_FINISH
+   224                        ;        JSR     M_PROMPTR       ;Send message to console
+   225                        ;        JMP     M_WARM_MON      ;Warm Boot Monitor
+   226                        ;
+   227                        MSG_FINISH
+   228 00:0885: 84 03                STY     $03             ;Store MSG address
+   229 00:0887: 85 02                STA     $02             ;
+   230 00:0889: A0 00                LDY     #$00            ;Zero Y index
+   231                        MSG_LOOP
+   232 00:088B: B1 02                LDA     ($02),Y         ;Get Message
+   233 00:088D: F0 06                BEQ     MSG_EXIT        ;If end of message, branch
+   234 00:088F: 20 21 FF             JSR     B_CHROUT        ;Send to Console
+   235 00:0892: C8                   INY                     ;Increment Index
+   236 00:0893: 80 F6                BRA     MSG_LOOP        ;Branch back until null found
+   237                        ;
+   238                        MSG_EXIT
+   239 00:0895: 4C 03 F0             JMP     M_WARM_MON
+   240                        ;**************************************************************************************************
+   241                        ;
+   242                        ; Supporting Routines:
+   243                        ;
+   244                        ; Check Boot Block Signature
+   245                        ;
+   246                        BOOT_CHKSIG
+   247 00:0898: AD FF 09             LDA     $09FF           ;Get the last byte of the Boot Record
+   248 00:089B: C9 AA                CMP     #$AA            ;Compare for signature
+   249 00:089D: D0 CA                BNE     BAD_BOOT_BLK    ;Branch if not equal
+  Fri Apr 11 2025  7:14                                                                                                    Page 5
+
+
+   250 00:089F: AD FE 09             LDA     $09FE           ;Get signature of next to last byte
+   251 00:08A2: C9 55                CMP     #$55            ;Check for correct bit pattern
+   252 00:08A4: D0 C3                BNE     BAD_BOOT_BLK    ;Branch if not equal
+   253 00:08A6: 60                   RTS                     ;Return to caller
+   254                        ;
+   255                        ; Check Boot Parameter Block checksum
+   256                        ;
+   257                        BPB_CHKSUM
+   258 00:08A7: 18                   CLC                     ;Clear Carry for add
+   259 00:08A8: A2 FF                LDX     #$FF            ;Set index count-1
+   260 00:08AA: A9 00                LDA     #$00            ;Zero A Reg
+   261                        BPB_CK_LP
+   262 00:08AC: E8                   INX                     ;Increment Index (starts at 0)
+   263 00:08AD: 7D DE 09             ADC     DISK_BPB,X      ;Add in BPB data
+   264 00:08B0: E0 1E                CPX     #30             ;Decrement count
+   265 00:08B2: D0 F8                BNE     BPB_CK_LP       ;Branch back till done
+   266                        ;
+   267 00:08B4: E8                   INX                     ;point to checksum byte
+   268 00:08B5: DD DE 09             CMP     DISK_BPB,X      ;A Reg should match checksum
+   269 00:08B8: D0 B5                BNE     BAD_BOOT_CHK    ;Failed, branch and bail
+   270 00:08BA: 60                   RTS                     ;Return to caller
+   271                        ;
+   272                        ; Check Load Header Checksum
+   273                        ;
+   274                        HEADER_CHKSUM
+   275 00:08BB: A2 FF                LDX     #$FF            ;Set Index for counting
+   276 00:08BD: 18                   CLC                     ;Clewar Carry for add
+   277 00:08BE: A9 00                LDA     #$00            ;Zero A Reg
+   278                        LH_CHK_LP
+   279 00:08C0: E8                   INX                     ;Increment Index (starts at #0)
+   280 00:08C1: 7D 00 0A             ADC     $0A00,X         ;Add in Load Header data
+   281 00:08C4: E0 0F                CPX     #15             ;Increment count
+   282 00:08C6: D0 F8                BNE     LH_CHK_LP       ;Loop back until done
+   283                        ;
+   284 00:08C8: DD 00 10             CMP     $1000,X         ;A Reg should match checksum
+   285 00:08CB: D0 AE                BNE     BAD_HEADER      ;If Bad match, show error and exit
+   286                        ;
+   287                        ; Load Block(s) from Disk Drive:
+   288                        ;
+   289                        LOAD_BLOCK
+   290 00:08CD: 20 12 FF             JSR     B_IDE_SET_ADDR  ;Call BIOS
+   291                        ;
+   292 00:08D0: AD E4 09             LDA     DISK_BPB+6      ;Get LBA low
+   293 00:08D3: AC E5 09             LDY     DISK_BPB+7      ;Get LBA high
+   294 00:08D6: AE E6 09             LDX     DISK_BPB+8      ;Get LBA ext
+   295 00:08D9: 20 0F FF             JSR     B_IDE_SET_LBA   ;Call BIOS
+   296                        ;
+   297 00:08DC: 20 09 FF             JSR     B_IDE_READ_LBA  ;Call BIOS to read Boot image
+   298 00:08DF: A5 FB                LDA     IDE_STATUS_RAM  ;Get IDE Status
+   299 00:08E1: 4A                   LSR                     ;Shift error bit into carry
+   300 00:08E2: B0 91                BCS     BAD_BOOT_REC    ;Error loading boot record
+   301 00:08E4: 60                   RTS                     ;Return to Caller
+   302                        ;
+   303                        ;**************************************************************************************************
+   304                        ;
+   305                        ; Error Messages are kept here:
+   306                        ;
+   307                        BAD_BLOCK
+   308 00:08E5: 0D 0A 42 61          .DB     13,10,"Bad Boot Block Signature!"
+       00:08E9: 64 20 42 6F 
+       00:08ED: 6F 74 20 42 
+       00:08F1: 6C 6F 63 6B 
+       00:08F5: 20 53 69 67 
+  Fri Apr 11 2025  7:14                                                                                                    Page 6
+
+
+       00:08F9: 6E 61 74 75 
+       00:08FD: 72 65 21 
+   309 00:0900: 0D 0A 00             .DB     13,10,0         ;Boot Block Signature failed
+   310                        ;
+   311                        BAD_CHKSUM
+   312 00:0903: 0D 0A 42 61          .DB     13,10,"Bad Boot Block Checksum!"
+       00:0907: 64 20 42 6F 
+       00:090B: 6F 74 20 42 
+       00:090F: 6C 6F 63 6B 
+       00:0913: 20 43 68 65 
+       00:0917: 63 6B 73 75 
+       00:091B: 6D 21 
+   313 00:091D: 0D 0A 00             .DB     13,10,0         ;Boot Block Checksum failed
+   314                        ;
+   315                        BAD_BOOT_MSG
+   316 00:0920: 0D 0A 42 61          .DB     13,10,"Bad Boot Image"
+       00:0924: 64 20 42 6F 
+       00:0928: 6F 74 20 49 
+       00:092C: 6D 61 67 65 
+   317 00:0930: 0D 0A 00             .DB     13,10,0         ;Boot Image failed to load
+   318                        ;
+   319                        BAD_HDR_MSG
+   320 00:0933: 0D 0A 42 61          .DB     13,10,"Bad Load Header in Boot Image"
+       00:0937: 64 20 4C 6F 
+       00:093B: 61 64 20 48 
+       00:093F: 65 61 64 65 
+       00:0943: 72 20 69 6E 
+       00:0947: 20 42 6F 6F 
+       00:094B: 74 20 49 6D 
+       00:094F: 61 67 65 
+   321 00:0952: 0D 0A 00             .DB     13,10,0         ;Boot Image Load Header failed Checksum
+   322                        ;
+   323                        NO_OS
+   324 00:0955: 0D 0A 4E 6F          .DB     13,10,"No Operating System found!"
+       00:0959: 20 4F 70 65 
+       00:095D: 72 61 74 69 
+       00:0961: 6E 67 20 53 
+       00:0965: 79 73 74 65 
+       00:0969: 6D 20 66 6F 
+       00:096D: 75 6E 64 21 
+   325 00:0971: 0D 0A 00             .DB     13,10,0         ;No valid OS Image (String ID failed)
+   326                        ;
+   327                        COPYRIGHT
+   328 00:0974: 28 63 29 20          .DB     "(c) K.E. Maier 2025"
+       00:0978: 4B 2E 45 2E 
+       00:097C: 20 4D 61 69 
+       00:0980: 65 72 20 32 
+       00:0984: 30 32 35 
+   329                        ;
+   330                        ;**************************************************************************************************
+   331                        ; 
+   332                        ;Boot Parameter Block is 32 bytes in length and has the following format:
+   333                        ; - As an OS Boot image might be moved to a different partition/location, the Boot Parameter Block
+   334                        ;       will use a 16-bit address to transfer the starting Data Block allocated to it. Note that
+   335                        ;       this does NOT include the Boot image space, which is separate by design. This provides a
+   336                        ;       level of protection so the OS shouldn't be able to clobber itself by accident.
+   337                        ;
+   338                        ;       Offset          Length          Description
+   339                        ;       0x00            1 byte          BPB descriptor = $65 by default
+   340                        ;       0x01            1 byte          Block count for Boot image (512-byte blocks)
+   341                        ;       0x02            2 bytes         Address to load Boot image to (16-bit)
+   342                        ;       0x04            2 bytes         Address to Start execution of Boot image (16-bit)
+   343                        ;
+  Fri Apr 11 2025  7:14                                                                                                    Page 7
+
+
+   344                        ;       0X06            4 bytes         LBA location of first Block of Boot image
+   345                        ;       0x0A            4 bytes         Total Blocks allocated to Boot image including Boot Block
+   346                        ;
+   347                        ;       0x0E            2 bytes         Address in Boot image to Xfer LBA offset for Block data
+   348                        ;       0X10            4 bytes         Starting Block of Data allocated to OS (non-Boot image)
+   349                        ;       0x14            4 bytes         Total count of Block Data allocated to OS
+   350                        ;
+   351                        ;       0x18            5 bytes         String ID for Boot image to validate it
+   352                        ;       0X1D            2 bytes         16-bit location in Boot image for String ID
+   353                        ;       0x1F            1 byte          8-bit Checksum of BPB
+   354                        ;
+   355                        ;**************************************************************************************************
+   356                        ;
+   357                                .ORG    $09DE           ;Offset to boot parameter block
+   358                        ;
+   359                        DISK_BPB                        ;Start of Boot records
+   360                        ;
+   361                        ;Boot Parameter Block start here:
+   362                        ;
+   363 00:09DE: 65                   .DB     #$65            ;BPB descriptor byte
+   364 00:09DF: 10                   .DB     #16             ;Block count for boot image (blocks are 512 bytes) 8KB
+   365 00:09E0: 00 D0                .DW     $D000           ;Memory address to load boot image to
+   366 00:09E2: 00 E4                .DW     $E400           ;Boot image address to start execution at
+   367                        ;
+   368 00:09E4: 00 00 02 00          .LONG   131072          ;LBA to start Boot Image
+   369 00:09E8: 00 00 02 00          .LONG   131072          ;Total Blocks allocated to Boot image
+   370                        ;
+   371 00:09EC: CD E6                .DW     $E6CD           ;Boot image offset for disk data starting block
+   372 00:09EE: 00 01 00 00          .LONG   256             ;Starting Block of Data allocated to OS (this value xfers to Boot image
+                    )
+   373 00:09F2: 00 01 02 00          .LONG   131328          ;Block count allocated to OS (Boot image and Data)
+   374                        ;
+   375                        BPB_STRING
+   376 00:09F6: 64 6F 73 36          .DB     "dos65"         ;String ID for Boot image validation
+       00:09FA: 35 
+   377 00:09FB: 0B D0                .DW     $D00B           ;Address in Boot image of String ID to validate Boot image
+   378 00:09FD: 1A                   .DB     #$1A            ;8-bit checksum byte for BPB
+   379                        ;
+   380                        ;**************************************************************************************************
+   381                        ; Boot Block ends with standard 2-byte signature to show valid record
+   382                        ;
+   383 00:09FE: 55 AA                .DW     $AA55           ;Signature bytes - mark as valid partition record
+   384                        ;
+   385                        ;**************************************************************************************************
+   386                                .END
+
+
+      Lines assembled: 885
+      Errors: 0
